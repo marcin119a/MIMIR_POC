@@ -15,7 +15,7 @@ import sys
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from src.data_utils import compute_shared_splits
+from data_utils import compute_shared_splits
 
 
 def main():
