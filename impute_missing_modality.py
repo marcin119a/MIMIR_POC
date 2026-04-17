@@ -30,11 +30,16 @@ from scipy.stats import pearsonr, spearmanr
 import sys
 from phase2_model import MIMIRPhase2
 from train_phase2 import Phase2Config as _Phase2Config
-# Checkpoint was saved from __main__, so unpickling requires Phase2Config there
+from crossmodal_model import CrossModalAttentionImputer
+from train_crossmodal import CrossModalConfig as _CrossModalConfig
+
+# Checkpoint was saved from __main__, so unpickling requires config classes there
 sys.modules[__name__].Phase2Config = _Phase2Config
+sys.modules[__name__].CrossModalConfig = _CrossModalConfig
 if "__main__" not in sys.modules:
     sys.modules["__main__"] = sys.modules[__name__]
 sys.modules["__main__"].Phase2Config = _Phase2Config
+sys.modules["__main__"].CrossModalConfig = _CrossModalConfig
 
 
 # ─── Display names ────────────────────────────────────────────────────────────
@@ -47,65 +52,93 @@ DISPLAY_NAME = {
 
 # ─── Model loading ────────────────────────────────────────────────────────────
 
-def load_model(checkpoint_path: str, device: torch.device) -> tuple[MIMIRPhase2, dict]:
+def load_model(checkpoint_path: str, device: torch.device):
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     modality_dims = ckpt["modality_dims"]
     cfg = ckpt["config"]
+    model_type = ckpt.get("model_type", "phase2")
 
-    model = MIMIRPhase2(
-        modality_dims=modality_dims,
-        latent_dim=cfg.latent_dim,
-        shared_dim=cfg.shared_dim,
-        encoder_hidden=cfg.encoder_hidden,
-        decoder_hidden=cfg.decoder_hidden,
-        dropout=cfg.dropout,
-    )
+    if model_type == "crossmodal":
+        model = CrossModalAttentionImputer(
+            modality_dims=modality_dims,
+            d_model=cfg.d_model,
+            n_latents=cfg.n_latents,
+            n_heads=cfg.n_heads,
+            n_within_layers=cfg.n_within_layers,
+            n_cross_layers=cfg.n_cross_layers,
+            decoder_hidden=cfg.decoder_hidden,
+            proj_dim=cfg.proj_dim,
+            dropout=cfg.dropout,
+        )
+    else:
+        model = MIMIRPhase2(
+            modality_dims=modality_dims,
+            latent_dim=cfg.latent_dim,
+            shared_dim=cfg.shared_dim,
+            encoder_hidden=cfg.encoder_hidden,
+            decoder_hidden=cfg.decoder_hidden,
+            dropout=cfg.dropout,
+        )
+
     model.load_state_dict(ckpt["model_state_dict"])
     model.to(device)
     model.eval()
-    print(f"Loaded checkpoint (epoch {ckpt['epoch']}, val_loss={ckpt['val_loss']:.4f})")
-    return model, modality_dims
+    print(f"Loaded {model_type} checkpoint (epoch {ckpt['epoch']}, val_loss={ckpt['val_loss']:.4f})")
+    return model, modality_dims, model_type
 
 
 # ─── Imputation ───────────────────────────────────────────────────────────────
 
 @torch.no_grad()
 def impute(
-    model: MIMIRPhase2,
+    model,
     data: dict,
     present_mods: list[str],
     target_mod: str,
     samples: list[str],
     batch_size: int,
     device: torch.device,
+    model_type: str = "phase2",
 ) -> np.ndarray:
     """Impute `target_mod` from `present_mods` for the given samples."""
-    tensors = {m: torch.tensor(data[m].loc[samples].values, dtype=torch.float32) for m in present_mods}
+    tensors = {
+        m: torch.tensor(data[m].loc[samples].values, dtype=torch.float32)
+        for m in present_mods
+    }
     n = len(samples)
     preds = []
 
     for start in range(0, n, batch_size):
         end = min(start + batch_size, n)
-        z_proj_list = []
-        for m in present_mods:
-            x = tensors[m][start:end].to(device)
-            h = model.encode(x, m)
-            z = model.project(h, m)
-            z_proj_list.append(z)
 
-        z_shared = torch.stack(z_proj_list, dim=1).mean(dim=1)
-        x_hat = model.decode(z_shared, target_mod)
+        if model_type == "crossmodal":
+            z_list = [
+                model.compress(tensors[m][start:end].to(device), m)
+                for m in present_mods
+            ]
+            x_hat = model.impute(z_list, target_mod)
+        else:
+            z_proj_list = []
+            for m in present_mods:
+                x = tensors[m][start:end].to(device)
+                h = model.encode(x, m)
+                z = model.project(h, m)
+                z_proj_list.append(z)
+            z_shared = torch.stack(z_proj_list, dim=1).mean(dim=1)
+            x_hat = model.decode(z_shared, target_mod)
+
         preds.append(x_hat.cpu().numpy())
 
     return np.concatenate(preds, axis=0)
 
 
 def leave_one_out_imputation(
-    model: MIMIRPhase2,
+    model,
     data: dict,
     samples: list[str],
     batch_size: int,
     device: torch.device,
+    model_type: str = "phase2",
 ) -> dict:
     """LOO: for each modality, impute it from all others."""
     modalities = list(data.keys())
@@ -114,18 +147,19 @@ def leave_one_out_imputation(
     for target in modalities:
         present = [m for m in modalities if m != target]
         print(f"  LOO: present={present} → target={target}")
-        pred = impute(model, data, present, target, samples, batch_size, device)
+        pred = impute(model, data, present, target, samples, batch_size, device, model_type)
         pred_dict[(tuple(present), target)] = pred
 
     return pred_dict
 
 
 def all_possible_imputation(
-    model: MIMIRPhase2,
+    model,
     data: dict,
     samples: list[str],
     batch_size: int,
     device: torch.device,
+    model_type: str = "phase2",
 ) -> dict:
     """Enumerate all non-empty proper subsets of observed modalities."""
     modalities = list(data.keys())
@@ -138,7 +172,9 @@ def all_possible_imputation(
                 if target in present:
                     continue
                 print(f"  AP: present={list(present)} → target={target}")
-                pred = impute(model, data, list(present), target, samples, batch_size, device)
+                pred = impute(
+                    model, data, list(present), target, samples, batch_size, device, model_type
+                )
                 pred_dict[(present, target)] = pred
 
     return pred_dict
@@ -254,7 +290,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Phase 3: Impute missing modalities")
     p.add_argument("--data",       default="data/tcga_redo_mlomicZ.pkl",      help="Path to multi-omic pickle")
     p.add_argument("--splits",     default="data/splits.json",                help="Path to splits JSON")
-    p.add_argument("--checkpoint", default="checkpoints_phase2/best_model.pt",help="MIMIRPhase2 checkpoint (.pt)")
+    p.add_argument("--checkpoint", default="checkpoints_phase2/best_model.pt",help="Model checkpoint (.pt) — auto-detects model type")
     p.add_argument("--out",        default="results/imputation_modality",      help="Output directory")
     p.add_argument("--device",     default=None,                               help="cuda / mps / cpu (auto if omitted)")
     p.add_argument("--batch_size", type=int, default=256)
@@ -293,9 +329,9 @@ def main() -> None:
     )
 
     # Keep only modalities present in this checkpoint
-    model, modality_dims = load_model(args.checkpoint, device)
+    model, modality_dims, model_type = load_model(args.checkpoint, device)
     data = {k: v for k, v in data.items() if k in modality_dims}
-    print(f"Active modalities: {list(data.keys())}")
+    print(f"Active modalities: {list(data.keys())}  |  model_type={model_type}")
 
     # Filter test samples to those present in every modality
     test_samples = [s for s in test_samples if all(s in data[m].index for m in data)]
@@ -306,7 +342,9 @@ def main() -> None:
     print("  Leave-one-modality-out imputation")
     print("="*60)
 
-    pred_loo = leave_one_out_imputation(model, data, test_samples, args.batch_size, device)
+    pred_loo = leave_one_out_imputation(
+        model, data, test_samples, args.batch_size, device, model_type
+    )
     metrics_loo = evaluate_imputations(pred_loo, data, test_samples)
     print_metrics(metrics_loo, label="LOO Imputation Metrics")
 
@@ -319,7 +357,9 @@ def main() -> None:
         print("  All-possible-missingness imputation")
         print("="*60)
 
-        pred_ap = all_possible_imputation(model, data, test_samples, args.batch_size, device)
+        pred_ap = all_possible_imputation(
+            model, data, test_samples, args.batch_size, device, model_type
+        )
         metrics_ap = evaluate_imputations(pred_ap, data, test_samples)
         print_metrics(metrics_ap, label="All-Possible Imputation Metrics")
 
