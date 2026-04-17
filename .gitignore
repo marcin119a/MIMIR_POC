@@ -1,0 +1,45 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Pytest / type checkers / tools
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# ML: checkpoints & experiment logs (adjust if you need to track small artifacts)
+checkpoints_phase2/
+*.pt
+*.pth
+*.ckpt
+wandb/
+mlruns/
+lightning_logs/
+
+# Local data dumps (uncomment if you store large files under the repo)
+data/
+# *.parquet
+# *.csv
