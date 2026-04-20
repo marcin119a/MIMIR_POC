@@ -77,20 +77,23 @@ class SingleModalityDatasetAligned(Dataset):
 
 
 def compute_shared_splits(
-    data_dict: Dict[str, pd.DataFrame], 
-    val_size: float = 0.1, 
-    test_size: float = 0.2, 
-    seed: int = 42
+    data_dict: Dict[str, pd.DataFrame],
+    val_size: float = 0.1,
+    test_size: float = 0.2,
+    seed: int = 42,
+    require_all_modalities: bool = True,
 ):
     """
-    Compute a single train/val/test split based on the intersection of sample IDs
-    across all modalities.
+    Compute a single train/val/test split from the sample pool.
 
     Args:
         data_dict: dict(modality -> DataFrame with samples as index)
-        val_size: fraction of samples to use for validation (of total)
-        test_size: fraction of samples to use for test (of total)
-        seed: random seed for reproducibility
+        val_size: fraction of samples for validation
+        test_size: fraction of samples for test
+        seed: random seed
+        require_all_modalities: if True (default) use intersection (only samples
+            present in every modality); if False use union (include samples with
+            at least one modality).
 
     Returns:
         common_samples (list[str]),
@@ -99,7 +102,10 @@ def compute_shared_splits(
         test_idx (np.ndarray)
     """
     sample_sets = [set(df.index) for df in data_dict.values()]
-    common_samples = sorted(set.intersection(*sample_sets))
+    if require_all_modalities:
+        common_samples = sorted(set.intersection(*sample_sets))
+    else:
+        common_samples = sorted(set.union(*sample_sets))
 
     rng = np.random.RandomState(seed)
     idxs = np.arange(len(common_samples))

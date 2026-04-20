@@ -30,6 +30,9 @@ def main():
                         help="Fraction of samples for test (default: 0.2)")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed (default: 42)")
+    parser.add_argument("--all-modalities", action="store_true", default=False,
+                        help="Only include samples present in ALL modalities (intersection). "
+                             "Default: include samples with at least one modality (union).")
     args = parser.parse_args()
 
     print(f"Loading data from: {args.data}")
@@ -40,16 +43,20 @@ def main():
     for mod, df in data_dict.items():
         print(f"  {mod}: {df.shape}")
 
-    common_samples, train_idx, val_idx, test_idx = compute_shared_splits(
+    require_all = args.all_modalities
+    print(f"\nSample pool: {'intersection (all modalities)' if require_all else 'union (≥1 modality)'}")
+
+    all_samples, train_idx, val_idx, test_idx = compute_shared_splits(
         data_dict,
         val_size=args.val_size,
         test_size=args.test_size,
         seed=args.seed,
+        require_all_modalities=require_all,
     )
 
-    train_samples = [common_samples[i] for i in train_idx]
-    val_samples   = [common_samples[i] for i in val_idx]
-    test_samples  = [common_samples[i] for i in test_idx]
+    train_samples = [all_samples[i] for i in train_idx]
+    val_samples   = [all_samples[i] for i in val_idx]
+    test_samples  = [all_samples[i] for i in test_idx]
 
     split_dict = {
         "train": train_samples,
@@ -58,7 +65,7 @@ def main():
     }
 
     print(f"\nSplit sizes:")
-    print(f"  Total common samples: {len(common_samples)}")
+    print(f"  Total samples: {len(all_samples)}")
     print(f"  Train: {len(train_samples)}")
     print(f"  Val:   {len(val_samples)}")
     print(f"  Test:  {len(test_samples)}")

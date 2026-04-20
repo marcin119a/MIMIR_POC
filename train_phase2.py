@@ -83,14 +83,28 @@ class MultiOmicDataset(Dataset):
         sentinel: float = -1.0,
     ):
         self.modalities = list(data_dict.keys())
-        valid = [b for b in barcodes if all(b in data_dict[m].index for m in self.modalities)]
-        self.tensors = {
-            m: torch.tensor(data_dict[m].loc[valid].values, dtype=torch.float32)
-            for m in self.modalities
-        }
+        # Accept patients with at least one modality (union instead of intersection)
+        valid = [b for b in barcodes if any(b in data_dict[m].index for m in self.modalities)]
         self.n = len(valid)
         self.mask_rate = mask_rate
         self.sentinel = sentinel
+
+        # Per-modality tensors — missing patients get all-sentinel rows
+        self.tensors: dict[str, torch.Tensor] = {}
+        self.available: dict[str, torch.Tensor] = {}  # (N,) bool: patient has this modality
+        for m in self.modalities:
+            dim = data_dict[m].shape[1]
+            rows = []
+            avail = []
+            for b in valid:
+                if b in data_dict[m].index:
+                    rows.append(data_dict[m].loc[b].values)
+                    avail.append(True)
+                else:
+                    rows.append(np.full(dim, sentinel, dtype=np.float32))
+                    avail.append(False)
+            self.tensors[m] = torch.tensor(np.stack(rows), dtype=torch.float32)
+            self.available[m] = torch.tensor(avail, dtype=torch.bool)
 
     def __len__(self) -> int:
         return self.n
@@ -99,10 +113,11 @@ class MultiOmicDataset(Dataset):
         out = {}
         for m in self.modalities:
             x = self.tensors[m][idx]
+            avail = self.available[m][idx]
             feat_mask = torch.rand_like(x) < self.mask_rate
             x_masked = x.clone()
             x_masked[feat_mask] = self.sentinel
-            out[m] = {"orig": x, "masked": x_masked, "feat_mask": feat_mask}
+            out[m] = {"orig": x, "masked": x_masked, "feat_mask": feat_mask, "available": avail}
         return out
 
 
@@ -267,12 +282,25 @@ def run_batch(
     M = len(modalities)
     B = next(iter(batch.values()))["orig"].shape[0]
 
-    orig     = {m: batch[m]["orig"].to(device)      for m in modalities}
-    masked   = {m: batch[m]["masked"].to(device)    for m in modalities}
-    feat_mask= {m: batch[m]["feat_mask"].to(device) for m in modalities}
+    orig      = {m: batch[m]["orig"].to(device)      for m in modalities}
+    masked    = {m: batch[m]["masked"].to(device)    for m in modalities}
+    feat_mask = {m: batch[m]["feat_mask"].to(device) for m in modalities}
+    # Real availability: patients missing a modality are always unobserved for it
+    avail_mask = torch.stack(
+        [batch[m]["available"].to(device) for m in modalities], dim=1
+    )  # (B, M) bool
 
     dropout_p = config.modality_dropout_prob if training else 0.0
-    obs_mask  = sample_obs_mask(B, M, dropout_p, device)   # (B, M) bool
+    obs_mask  = sample_obs_mask(B, M, dropout_p, device) & avail_mask  # (B, M) bool
+    # Ensure each sample has at least one observed modality
+    all_dropped = ~obs_mask.any(dim=1)
+    if all_dropped.any():
+        # Restore first available modality for fully-dropped samples
+        first_avail = avail_mask[all_dropped].float().argmax(dim=1)
+        dropped_indices = all_dropped.nonzero(as_tuple=True)[0]
+        obs_mask[all_dropped] = False
+        for k, idx in enumerate(dropped_indices):
+            obs_mask[idx, first_avail[k]] = True
 
     # ── Encode all modalities, project to shared space ──
     h_dict = {m: model.encode(masked[m], m) for m in modalities}
