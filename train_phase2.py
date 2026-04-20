@@ -5,7 +5,7 @@ Jointly optimises three objectives:
     L = Σ_m L_recon(m)  +  λ_contrast · L_contrast  +  λ_cross · L_cross
 
 where
-  L_recon     – masked MSE (all features + masked features) on observed modalities
+  L_recon     – α·L_masked + (1-α)·L_overall per modality (α=0.5); NaN positions excluded
   L_contrast  – InfoNCE across ordered modality pairs (τ = 0.1)
   L_cross     – leave-one-modality-out MSE imputation loss
 
@@ -60,6 +60,7 @@ class Phase2Config:
     lambda_contrast: float = 1.0
     lambda_cross: float = 1.0
     temperature: float = 0.1         # τ for InfoNCE
+    alpha_recon: float = 0.5         # weight on masked term vs overall term
 
     seed: int = 42
 
@@ -69,8 +70,11 @@ class Phase2Config:
 class MultiOmicDataset(Dataset):
     """
     Returns per-sample dicts:
-        {modality: {"orig": Tensor, "masked": Tensor, "feat_mask": BoolTensor}}
+        {modality: {"orig": Tensor, "masked": Tensor,
+                    "feat_mask": BoolTensor, "nan_mask": BoolTensor}}
 
+    nan_mask  – positions truly missing in the raw data (NaN → sentinel).
+    feat_mask – positions artificially masked during denoising (non-NaN only).
     Feature masking is applied lazily in __getitem__ so each epoch gets fresh masks.
     Only barcodes present in every modality are kept.
     """
@@ -99,10 +103,13 @@ class MultiOmicDataset(Dataset):
         out = {}
         for m in self.modalities:
             x = self.tensors[m][idx]
-            feat_mask = torch.rand_like(x) < self.mask_rate
+            nan_mask = torch.isnan(x)
+            x = x.clone()
+            x[nan_mask] = self.sentinel                             # NaN → sentinel
+            feat_mask = (~nan_mask) & (torch.rand_like(x) < self.mask_rate)  # mask only observed
             x_masked = x.clone()
             x_masked[feat_mask] = self.sentinel
-            out[m] = {"orig": x, "masked": x_masked, "feat_mask": feat_mask}
+            out[m] = {"orig": x, "masked": x_masked, "feat_mask": feat_mask, "nan_mask": nan_mask}
         return out
 
 
@@ -112,16 +119,26 @@ def masked_recon_loss(
     x_hat: torch.Tensor,
     x_orig: torch.Tensor,
     feat_mask: torch.Tensor,
+    nan_mask: torch.Tensor,
+    alpha: float = 0.5,
 ) -> torch.Tensor:
     """
-    MSE over all features  +  MSE restricted to masked features.
-    Both terms use mean reduction, encouraging reconstruction of observed
-    features while specifically penalising masked-position errors.
+    L_recon = α · L_masked + (1-α) · L_overall   (α = 0.5 per paper)
+
+    L_overall – MSE over all observed (non-NaN) features.
+    L_masked  – MSE restricted to artificially masked positions.
+    Truly missing values (nan_mask) are excluded from both terms.
     """
-    loss = F.mse_loss(x_hat, x_orig)
-    if feat_mask.any():
-        loss = loss + F.mse_loss(x_hat[feat_mask], x_orig[feat_mask])
-    return loss
+    obs = ~nan_mask                              # truly observed positions
+    l_overall = F.mse_loss(x_hat[obs], x_orig[obs]) if obs.any() else x_hat.new_tensor(0.0)
+
+    masked_obs = feat_mask & obs                 # artificially masked & non-NaN
+    if masked_obs.any():
+        l_masked = F.mse_loss(x_hat[masked_obs], x_orig[masked_obs])
+    else:
+        l_masked = l_overall                     # no masked positions: fall back to overall
+
+    return alpha * l_masked + (1.0 - alpha) * l_overall
 
 
 def contrastive_loss(
@@ -267,9 +284,10 @@ def run_batch(
     M = len(modalities)
     B = next(iter(batch.values()))["orig"].shape[0]
 
-    orig     = {m: batch[m]["orig"].to(device)      for m in modalities}
-    masked   = {m: batch[m]["masked"].to(device)    for m in modalities}
-    feat_mask= {m: batch[m]["feat_mask"].to(device) for m in modalities}
+    orig      = {m: batch[m]["orig"].to(device)      for m in modalities}
+    masked    = {m: batch[m]["masked"].to(device)    for m in modalities}
+    feat_mask = {m: batch[m]["feat_mask"].to(device) for m in modalities}
+    nan_mask  = {m: batch[m]["nan_mask"].to(device)  for m in modalities}
 
     dropout_p = config.modality_dropout_prob if training else 0.0
     obs_mask  = sample_obs_mask(B, M, dropout_p, device)   # (B, M) bool
@@ -290,7 +308,11 @@ def run_batch(
         obs_idx = obs_mask[:, i]
         if obs_idx.any():
             recon_loss = recon_loss + masked_recon_loss(
-                recons[m][obs_idx], orig[m][obs_idx], feat_mask[m][obs_idx]
+                recons[m][obs_idx],
+                orig[m][obs_idx],
+                feat_mask[m][obs_idx],
+                nan_mask[m][obs_idx],
+                alpha=config.alpha_recon,
             )
 
     # ── Contrastive loss ──
