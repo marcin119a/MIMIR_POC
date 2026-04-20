@@ -54,12 +54,13 @@ class Phase2Config:
     # Masking / dropout
     mask_rate: float = 0.20          # fraction of features randomly masked per sample
     modality_dropout_prob: float = 0.40  # per-sample prob of dropping each modality
-    sentinel: float = -1.0           # sentinel value for masked features
+    sentinel: float = 0.0            # sentinel value for masked features
 
     # Loss weights (paper: both = 1)
     lambda_contrast: float = 1.0
     lambda_cross: float = 1.0
     temperature: float = 0.1         # τ for InfoNCE
+    alpha_mask: float = 1.0          # weight for masked-position MSE (1-alpha for overall)
 
     seed: int = 42
 
@@ -127,16 +128,34 @@ def masked_recon_loss(
     x_hat: torch.Tensor,
     x_orig: torch.Tensor,
     feat_mask: torch.Tensor,
+    sentinel: float = -1.0,
+    alpha_mask: float = 1.0,
 ) -> torch.Tensor:
     """
-    MSE over all features  +  MSE restricted to masked features.
-    Both terms use mean reduction, encouraging reconstruction of observed
-    features while specifically penalising masked-position errors.
+    Phase-1-style reconstruction loss:
+      - Replaces true NaNs in x_orig with sentinel before computing errors.
+      - Excludes truly-missing positions from both overall and masked MSE.
+      - Returns alpha_mask * masked_mse + (1 - alpha_mask) * overall_mse.
     """
-    loss = F.mse_loss(x_hat, x_orig)
-    if feat_mask.any():
-        loss = loss + F.mse_loss(x_hat[feat_mask], x_orig[feat_mask])
-    return loss
+    orig_missing = torch.isnan(x_orig)
+    x_target = x_orig.clone()
+    x_target[orig_missing] = sentinel
+
+    diff_sq = (x_hat - x_target) ** 2
+    valid = ~orig_missing
+
+    if valid.any():
+        overall_mse = diff_sq[valid].mean()
+    else:
+        overall_mse = diff_sq.mean()
+
+    mask = feat_mask & valid
+    if mask.any():
+        masked_mse = diff_sq[mask].mean()
+    else:
+        masked_mse = overall_mse
+
+    return alpha_mask * masked_mse + (1.0 - alpha_mask) * overall_mse
 
 
 def contrastive_loss(
@@ -318,7 +337,8 @@ def run_batch(
         obs_idx = obs_mask[:, i]
         if obs_idx.any():
             recon_loss = recon_loss + masked_recon_loss(
-                recons[m][obs_idx], orig[m][obs_idx], feat_mask[m][obs_idx]
+                recons[m][obs_idx], orig[m][obs_idx], feat_mask[m][obs_idx],
+                sentinel=config.sentinel, alpha_mask=config.alpha_mask,
             )
 
     # ── Contrastive loss ──
