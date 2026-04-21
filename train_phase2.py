@@ -21,6 +21,7 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 import torch.nn.functional as F
+from scipy.stats import pearsonr
 from torch.optim import Adam
 from torch.utils.data import DataLoader, Dataset
 
@@ -54,13 +55,14 @@ class Phase2Config:
     # Masking / dropout
     mask_rate: float = 0.20          # fraction of features randomly masked per sample
     modality_dropout_prob: float = 0.40  # per-sample prob of dropping each modality
-    sentinel: float = 0.0            # sentinel value for masked features
+    sentinel: float = -3.0           # sentinel value for masked features (outside z-score range)
 
     # Loss weights (paper: both = 1)
     lambda_contrast: float = 1.0
     lambda_cross: float = 1.0
     temperature: float = 0.1         # τ for InfoNCE
-    alpha_mask: float = 1.0          # weight for masked-position MSE (1-alpha for overall)
+    contrast_mode: str = "cosine"    # "infonce" | "cosine"
+    alpha_mask: float = 0.5          # weight for masked-position MSE (1-alpha for overall)
 
     seed: int = 42
 
@@ -192,6 +194,40 @@ def contrastive_loss(
             sim = torch.mm(zm, zmp.T) / temperature          # (N, N)
             labels = torch.arange(sim.shape[0], device=device)
             total = total + F.cross_entropy(sim, labels)
+            n_pairs += 1
+
+    return total / n_pairs if n_pairs > 0 else total
+
+
+def cosine_alignment_loss(
+    z_proj: dict,
+    obs_mask: torch.Tensor,
+    modalities: list,
+) -> torch.Tensor:
+    """
+    Cosine alignment loss averaged over all ordered modality pairs.
+
+    For each ordered pair (m, m') restricted to samples where both modalities
+    are observed:
+        loss += (1 - (normalize(z_m) * normalize(z_m')).sum(dim=-1)).mean()
+
+    No negatives, no temperature — simply pulls same-sample embeddings together.
+    """
+    device = next(iter(z_proj.values())).device
+    total = torch.tensor(0.0, device=device)
+    n_pairs = 0
+
+    for i, m in enumerate(modalities):
+        for j, mp in enumerate(modalities):
+            if i == j:
+                continue
+            both = obs_mask[:, i] & obs_mask[:, j]
+            if both.sum() < 1:
+                continue
+
+            z1 = F.normalize(z_proj[m][both],  dim=-1)
+            z2 = F.normalize(z_proj[mp][both], dim=-1)
+            total = total + (1.0 - (z1 * z2).sum(dim=-1)).mean()
             n_pairs += 1
 
     return total / n_pairs if n_pairs > 0 else total
@@ -341,8 +377,11 @@ def run_batch(
                 sentinel=config.sentinel, alpha_mask=config.alpha_mask,
             )
 
-    # ── Contrastive loss ──
-    c_loss = contrastive_loss(z_proj, obs_mask, modalities, config.temperature)
+    # ── Contrastive / alignment loss ──
+    if config.contrast_mode == "cosine":
+        c_loss = cosine_alignment_loss(z_proj, obs_mask, modalities)
+    else:
+        c_loss = contrastive_loss(z_proj, obs_mask, modalities, config.temperature)
 
     # ── Cross-modal imputation loss ──
     lomo_loss = cross_modal_imputation_loss(
@@ -355,6 +394,55 @@ def run_batch(
         + config.lambda_cross    * lomo_loss
     )
     return total, recon_loss.item(), c_loss.item(), lomo_loss.item()
+
+
+# ── LOO imputation eval ───────────────────────────────────────────────────────
+
+@torch.no_grad()
+def eval_loo_imputation(
+    model: MIMIRPhase2,
+    data_dict: dict,
+    samples: list,
+    device: torch.device,
+    batch_size: int = 512,
+) -> dict:
+    """LOO imputation metrics on samples present in all modalities."""
+    model.eval()
+    modalities = list(data_dict.keys())
+    full = [s for s in samples if all(s in data_dict[m].index for m in modalities)]
+    if not full:
+        return {}
+
+    metrics = {}
+    for target in modalities:
+        present = [m for m in modalities if m != target]
+        tensors = {
+            m: torch.tensor(data_dict[m].loc[full].values, dtype=torch.float32)
+            for m in present
+        }
+        true = data_dict[target].loc[full].values.astype(np.float32)
+        preds = []
+        for start in range(0, len(full), batch_size):
+            end = min(start + batch_size, len(full))
+            z_list = [
+                model.project(model.encode(tensors[m][start:end].to(device), m), m)
+                for m in present
+            ]
+            z_shared = torch.stack(z_list, dim=1).mean(dim=1)
+            preds.append(model.decode(z_shared, target).cpu().numpy())
+        pred = np.concatenate(preds, axis=0)
+        mse = float(np.mean((pred - true) ** 2))
+        r, _ = pearsonr(pred.ravel(), true.ravel())
+        metrics[(tuple(present), target)] = {"mse": mse, "pearson": float(r)}
+    return metrics
+
+
+def format_loo_metrics(metrics: dict) -> str:
+    parts = []
+    for (present, target), m in metrics.items():
+        present_str = "+".join(present)
+        parts.append(f"{present_str}→{target}: MSE={m['mse']:.4f} r={m['pearson']:.4f}")
+    return " | ".join(parts)
 
 
 # ── Train / eval epochs ───────────────────────────────────────────────────────
@@ -433,7 +521,8 @@ def main():
     val_ds = MultiOmicDataset(
         data_dict, splits["val"], config.mask_rate, config.sentinel
     )
-    print(f"Samples  train={len(train_ds)}  val={len(val_ds)}")
+    val_full_samples = [s for s in splits["val"] if all(s in data_dict[m].index for m in data_dict)]
+    print(f"Samples  train={len(train_ds)}  val={len(val_ds)}  val_full={len(val_full_samples)}")
 
     pin = device.type == "cuda"
     train_loader = DataLoader(
@@ -466,7 +555,7 @@ def main():
 
     os.makedirs(config.checkpoint_dir, exist_ok=True)
     best_ckpt = os.path.join(config.checkpoint_dir, "best_model.pt")
-    best_val   = float("inf")
+    best_loo_r = -float("inf")  # mean Pearson r across all LOO targets
     patience_ctr = 0
 
     header = f"{'Epoch':>5} | {'TrLoss':>8} | {'VaLoss':>8} | {'Recon':>8} | {'Contr':>8} | {'LOMO':>8} | Time"
@@ -484,15 +573,21 @@ def main():
             f"{vl[1]:>8.4f} | {vl[2]:>8.4f} | {vl[3]:>8.4f} | {dt:.1f}s"
         )
 
-        if vl[0] < best_val:
-            best_val = vl[0]
+        loo = eval_loo_imputation(model, data_dict, val_full_samples, device)
+        mean_r = float(np.mean([m["pearson"] for m in loo.values()])) if loo else -1.0
+        if loo:
+            print(f"        LOO │ {format_loo_metrics(loo)}  [mean r={mean_r:.4f}{'*' if mean_r > best_loo_r else ''}]")
+
+        if mean_r > best_loo_r:
+            best_loo_r = mean_r
             patience_ctr = 0
             torch.save(
                 {
                     "epoch": epoch,
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
-                    "val_loss": best_val,
+                    "val_loss": vl[0],
+                    "best_loo_r": best_loo_r,
                     "config": config,
                     "modality_dims": modality_dims,
                 },
@@ -504,7 +599,7 @@ def main():
                 print(f"\nEarly stopping at epoch {epoch}.")
                 break
 
-    print(f"\nBest val loss: {best_val:.4f}  →  {best_ckpt}")
+    print(f"\nBest LOO mean r: {best_loo_r:.4f}  →  {best_ckpt}")
 
 
 if __name__ == "__main__":
