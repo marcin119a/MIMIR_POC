@@ -18,6 +18,9 @@ import pickle
 import time
 from dataclasses import dataclass
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -355,6 +358,35 @@ def eval_epoch(
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+def plot_learning_curves(history: dict, output_dir: str) -> None:
+    epochs = history["epoch"]
+
+    loss_groups = [
+        ("Total Loss",      "train_total",    "val_total"),
+        ("Reconstruction",  "train_recon",    "val_recon"),
+        ("Contrastive",     "train_contrast", "val_contrast"),
+        ("LOMO Imputation", "train_lomo",     "val_lomo"),
+    ]
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    fig.suptitle("Learning Curves — Phase 2 Training", fontsize=14, fontweight="bold")
+
+    for ax, (title, tr_key, vl_key) in zip(axes.flat, loss_groups):
+        ax.plot(epochs, history[tr_key], label="Train", linewidth=1.5)
+        ax.plot(epochs, history[vl_key], label="Val",   linewidth=1.5, linestyle="--")
+        ax.set_title(title)
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Loss")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    out_path = os.path.join(output_dir, "learning_curves.png")
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Learning curves saved → {out_path}")
+
+
 def get_device() -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda")
@@ -421,6 +453,13 @@ def main():
     best_val   = float("inf")
     patience_ctr = 0
 
+    history = {
+        "epoch": [],
+        "train_total": [], "val_total": [],
+        "val_recon": [], "val_contrast": [], "val_lomo": [],
+        "train_recon": [], "train_contrast": [], "train_lomo": [],
+    }
+
     header = f"{'Epoch':>5} | {'TrLoss':>8} | {'VaLoss':>8} | {'Recon':>8} | {'Contr':>8} | {'LOMO':>8} | Time"
     print(f"\n{header}")
     print("-" * len(header))
@@ -435,6 +474,16 @@ def main():
             f"{epoch:>5} | {tr[0]:>8.4f} | {vl[0]:>8.4f} | "
             f"{vl[1]:>8.4f} | {vl[2]:>8.4f} | {vl[3]:>8.4f} | {dt:.1f}s"
         )
+
+        history["epoch"].append(epoch)
+        history["train_total"].append(tr[0])
+        history["train_recon"].append(tr[1])
+        history["train_contrast"].append(tr[2])
+        history["train_lomo"].append(tr[3])
+        history["val_total"].append(vl[0])
+        history["val_recon"].append(vl[1])
+        history["val_contrast"].append(vl[2])
+        history["val_lomo"].append(vl[3])
 
         if vl[0] < best_val:
             best_val = vl[0]
@@ -456,6 +505,12 @@ def main():
                 print(f"\nEarly stopping at epoch {epoch}.")
                 break
 
+    history_path = os.path.join(config.checkpoint_dir, "loss_history.json")
+    with open(history_path, "w") as f:
+        json.dump(history, f, indent=2)
+    print(f"Loss history saved → {history_path}")
+
+    plot_learning_curves(history, config.checkpoint_dir)
     print(f"\nBest val loss: {best_val:.4f}  →  {best_ckpt}")
 
 
