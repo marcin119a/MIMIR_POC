@@ -6,7 +6,7 @@ Jointly optimises three objectives:
 
 where
   L_recon     – masked MSE (all features + masked features) on observed modalities
-  L_contrast  – InfoNCE across ordered modality pairs (τ = 0.1)
+  L_contrast  – cosine alignment across ordered modality pairs
   L_cross     – leave-one-modality-out MSE imputation loss
 
 Encoders and decoders are randomly initialised (no Phase 1 pretraining).
@@ -60,8 +60,6 @@ class Phase2Config:
     # Loss weights (paper: both = 1)
     lambda_contrast: float = 1.0
     lambda_cross: float = 1.0
-    temperature: float = 0.1         # τ for InfoNCE
-    contrast_mode: str = "cosine"    # "infonce" | "cosine"
     alpha_mask: float = 0.5          # weight for masked-position MSE (1-alpha for overall)
 
     seed: int = 42
@@ -159,44 +157,6 @@ def masked_recon_loss(
 
     return alpha_mask * masked_mse + (1.0 - alpha_mask) * overall_mse
 
-
-def contrastive_loss(
-    z_proj: dict,
-    obs_mask: torch.Tensor,
-    modalities: list,
-    temperature: float,
-) -> torch.Tensor:
-    """
-    InfoNCE (NT-Xent) loss averaged over all ordered modality pairs.
-
-    For each ordered pair (m, m') we:
-      1. Restrict to samples where both modalities are observed.
-      2. Build cosine-similarity matrix S_ab = cos(z_m^a, z_m'^b) / τ.
-      3. Treat the diagonal as positives (cross-entropy with identity labels).
-
-    Only contributes when ≥2 samples have a given pair of modalities observed.
-    """
-    device = next(iter(z_proj.values())).device
-    total = torch.tensor(0.0, device=device)
-    n_pairs = 0
-
-    for i, m in enumerate(modalities):
-        for j, mp in enumerate(modalities):
-            if i == j:
-                continue
-            both = obs_mask[:, i] & obs_mask[:, j]
-            if both.sum() < 2:
-                continue
-
-            zm  = F.normalize(z_proj[m][both],  dim=-1)
-            zmp = F.normalize(z_proj[mp][both], dim=-1)
-
-            sim = torch.mm(zm, zmp.T) / temperature          # (N, N)
-            labels = torch.arange(sim.shape[0], device=device)
-            total = total + F.cross_entropy(sim, labels)
-            n_pairs += 1
-
-    return total / n_pairs if n_pairs > 0 else total
 
 
 def cosine_alignment_loss(
@@ -378,10 +338,7 @@ def run_batch(
             )
 
     # ── Contrastive / alignment loss ──
-    if config.contrast_mode == "cosine":
-        c_loss = cosine_alignment_loss(z_proj, obs_mask, modalities)
-    else:
-        c_loss = contrastive_loss(z_proj, obs_mask, modalities, config.temperature)
+    c_loss = cosine_alignment_loss(z_proj, obs_mask, modalities)
 
     # ── Cross-modal imputation loss ──
     lomo_loss = cross_modal_imputation_loss(
