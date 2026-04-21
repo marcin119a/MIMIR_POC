@@ -1,15 +1,16 @@
 """
-Phase 2 training: multi-modal shared representation.
+UniMIMIR training: unified multi-modal shared representation.
 
 Jointly optimises three objectives:
     L = Σ_m L_recon(m)  +  λ_contrast · L_contrast  +  λ_cross · L_cross
 
 where
   L_recon     – masked MSE (all features + masked features) on observed modalities
-  L_contrast  – InfoNCE across ordered modality pairs (τ = 0.1)
+  L_contrast  – cosine alignment across ordered modality pairs
   L_cross     – leave-one-modality-out MSE imputation loss
 
-Encoders and decoders are randomly initialised (no Phase 1 pretraining).
+Supports patients with any subset of modalities (including a single modality).
+Encoders and decoders are randomly initialised (no pretraining).
 """
 
 import json
@@ -24,20 +25,21 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
+from scipy.stats import pearsonr
 from torch.optim import Adam
 from torch.utils.data import DataLoader, Dataset
 
-from phase2_model import MIMIRPhase2
+from unimimir_model import UniMIMIR
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
 @dataclass
-class Phase2Config:
+class UniMIMIRConfig:
     # Paths
     data_path: str = "data/tcga_redo_mlomicZ.pkl"
     splits_path: str = "data/splits.json"
-    checkpoint_dir: str = "checkpoints_phase2"
+    checkpoint_dir: str = "checkpoints"
 
     # Model
     latent_dim: int = 128
@@ -57,12 +59,12 @@ class Phase2Config:
     # Masking / dropout
     mask_rate: float = 0.20          # fraction of features randomly masked per sample
     modality_dropout_prob: float = 0.40  # per-sample prob of dropping each modality
-    sentinel: float = -1.0           # sentinel value for masked features
+    sentinel: float = -3.0           # sentinel value for masked features (outside z-score range)
 
     # Loss weights (paper: both = 1)
     lambda_contrast: float = 1.0
     lambda_cross: float = 1.0
-    temperature: float = 0.1         # τ for InfoNCE
+    alpha_mask: float = 0.5          # weight for masked-position MSE (1-alpha for overall)
 
     seed: int = 42
 
@@ -86,14 +88,28 @@ class MultiOmicDataset(Dataset):
         sentinel: float = -1.0,
     ):
         self.modalities = list(data_dict.keys())
-        valid = [b for b in barcodes if all(b in data_dict[m].index for m in self.modalities)]
-        self.tensors = {
-            m: torch.tensor(data_dict[m].loc[valid].values, dtype=torch.float32)
-            for m in self.modalities
-        }
+        # Accept patients with at least one modality (union instead of intersection)
+        valid = [b for b in barcodes if any(b in data_dict[m].index for m in self.modalities)]
         self.n = len(valid)
         self.mask_rate = mask_rate
         self.sentinel = sentinel
+
+        # Per-modality tensors — missing patients get all-sentinel rows
+        self.tensors: dict[str, torch.Tensor] = {}
+        self.available: dict[str, torch.Tensor] = {}  # (N,) bool: patient has this modality
+        for m in self.modalities:
+            dim = data_dict[m].shape[1]
+            rows = []
+            avail = []
+            for b in valid:
+                if b in data_dict[m].index:
+                    rows.append(data_dict[m].loc[b].values)
+                    avail.append(True)
+                else:
+                    rows.append(np.full(dim, sentinel, dtype=np.float32))
+                    avail.append(False)
+            self.tensors[m] = torch.tensor(np.stack(rows), dtype=torch.float32)
+            self.available[m] = torch.tensor(avail, dtype=torch.bool)
 
     def __len__(self) -> int:
         return self.n
@@ -102,10 +118,11 @@ class MultiOmicDataset(Dataset):
         out = {}
         for m in self.modalities:
             x = self.tensors[m][idx]
+            avail = self.available[m][idx]
             feat_mask = torch.rand_like(x) < self.mask_rate
             x_masked = x.clone()
             x_masked[feat_mask] = self.sentinel
-            out[m] = {"orig": x, "masked": x_masked, "feat_mask": feat_mask}
+            out[m] = {"orig": x, "masked": x_masked, "feat_mask": feat_mask, "available": avail}
         return out
 
 
@@ -115,33 +132,50 @@ def masked_recon_loss(
     x_hat: torch.Tensor,
     x_orig: torch.Tensor,
     feat_mask: torch.Tensor,
+    sentinel: float = -1.0,
+    alpha_mask: float = 1.0,
 ) -> torch.Tensor:
     """
-    MSE over all features  +  MSE restricted to masked features.
-    Both terms use mean reduction, encouraging reconstruction of observed
-    features while specifically penalising masked-position errors.
+    Phase-1-style reconstruction loss:
+      - Replaces true NaNs in x_orig with sentinel before computing errors.
+      - Excludes truly-missing positions from both overall and masked MSE.
+      - Returns alpha_mask * masked_mse + (1 - alpha_mask) * overall_mse.
     """
-    loss = F.mse_loss(x_hat, x_orig)
-    if feat_mask.any():
-        loss = loss + F.mse_loss(x_hat[feat_mask], x_orig[feat_mask])
-    return loss
+    orig_missing = torch.isnan(x_orig)
+    x_target = x_orig.clone()
+    x_target[orig_missing] = sentinel
+
+    diff_sq = (x_hat - x_target) ** 2
+    valid = ~orig_missing
+
+    if valid.any():
+        overall_mse = diff_sq[valid].mean()
+    else:
+        overall_mse = diff_sq.mean()
+
+    mask = feat_mask & valid
+    if mask.any():
+        masked_mse = diff_sq[mask].mean()
+    else:
+        masked_mse = overall_mse
+
+    return alpha_mask * masked_mse + (1.0 - alpha_mask) * overall_mse
 
 
-def contrastive_loss(
+
+def cosine_alignment_loss(
     z_proj: dict,
     obs_mask: torch.Tensor,
     modalities: list,
-    temperature: float,
 ) -> torch.Tensor:
     """
-    InfoNCE (NT-Xent) loss averaged over all ordered modality pairs.
+    Cosine alignment loss averaged over all ordered modality pairs.
 
-    For each ordered pair (m, m') we:
-      1. Restrict to samples where both modalities are observed.
-      2. Build cosine-similarity matrix S_ab = cos(z_m^a, z_m'^b) / τ.
-      3. Treat the diagonal as positives (cross-entropy with identity labels).
+    For each ordered pair (m, m') restricted to samples where both modalities
+    are observed:
+        loss += (1 - (normalize(z_m) * normalize(z_m')).sum(dim=-1)).mean()
 
-    Only contributes when ≥2 samples have a given pair of modalities observed.
+    No negatives, no temperature — simply pulls same-sample embeddings together.
     """
     device = next(iter(z_proj.values())).device
     total = torch.tensor(0.0, device=device)
@@ -152,22 +186,19 @@ def contrastive_loss(
             if i == j:
                 continue
             both = obs_mask[:, i] & obs_mask[:, j]
-            if both.sum() < 2:
+            if both.sum() < 1:
                 continue
 
-            zm  = F.normalize(z_proj[m][both],  dim=-1)
-            zmp = F.normalize(z_proj[mp][both], dim=-1)
-
-            sim = torch.mm(zm, zmp.T) / temperature          # (N, N)
-            labels = torch.arange(sim.shape[0], device=device)
-            total = total + F.cross_entropy(sim, labels)
+            z1 = F.normalize(z_proj[m][both],  dim=-1)
+            z2 = F.normalize(z_proj[mp][both], dim=-1)
+            total = total + (1.0 - (z1 * z2).sum(dim=-1)).mean()
             n_pairs += 1
 
     return total / n_pairs if n_pairs > 0 else total
 
 
 def cross_modal_imputation_loss(
-    model: MIMIRPhase2,
+    model: UniMIMIR,
     orig: dict,
     feat_mask: dict,
     obs_mask: torch.Tensor,
@@ -254,9 +285,9 @@ def sample_obs_mask(
 # ── Batch step ────────────────────────────────────────────────────────────────
 
 def run_batch(
-    model: MIMIRPhase2,
+    model: UniMIMIR,
     batch: dict,
-    config: Phase2Config,
+    config: UniMIMIRConfig,
     device: torch.device,
     training: bool,
 ) -> tuple:
@@ -270,12 +301,25 @@ def run_batch(
     M = len(modalities)
     B = next(iter(batch.values()))["orig"].shape[0]
 
-    orig     = {m: batch[m]["orig"].to(device)      for m in modalities}
-    masked   = {m: batch[m]["masked"].to(device)    for m in modalities}
-    feat_mask= {m: batch[m]["feat_mask"].to(device) for m in modalities}
+    orig      = {m: batch[m]["orig"].to(device)      for m in modalities}
+    masked    = {m: batch[m]["masked"].to(device)    for m in modalities}
+    feat_mask = {m: batch[m]["feat_mask"].to(device) for m in modalities}
+    # Real availability: patients missing a modality are always unobserved for it
+    avail_mask = torch.stack(
+        [batch[m]["available"].to(device) for m in modalities], dim=1
+    )  # (B, M) bool
 
     dropout_p = config.modality_dropout_prob if training else 0.0
-    obs_mask  = sample_obs_mask(B, M, dropout_p, device)   # (B, M) bool
+    obs_mask  = sample_obs_mask(B, M, dropout_p, device) & avail_mask  # (B, M) bool
+    # Ensure each sample has at least one observed modality
+    all_dropped = ~obs_mask.any(dim=1)
+    if all_dropped.any():
+        # Restore first available modality for fully-dropped samples
+        first_avail = avail_mask[all_dropped].float().argmax(dim=1)
+        dropped_indices = all_dropped.nonzero(as_tuple=True)[0]
+        obs_mask[all_dropped] = False
+        for k, idx in enumerate(dropped_indices):
+            obs_mask[idx, first_avail[k]] = True
 
     # ── Encode all modalities, project to shared space ──
     h_dict = {m: model.encode(masked[m], m) for m in modalities}
@@ -293,11 +337,12 @@ def run_batch(
         obs_idx = obs_mask[:, i]
         if obs_idx.any():
             recon_loss = recon_loss + masked_recon_loss(
-                recons[m][obs_idx], orig[m][obs_idx], feat_mask[m][obs_idx]
+                recons[m][obs_idx], orig[m][obs_idx], feat_mask[m][obs_idx],
+                sentinel=config.sentinel, alpha_mask=config.alpha_mask,
             )
 
-    # ── Contrastive loss ──
-    c_loss = contrastive_loss(z_proj, obs_mask, modalities, config.temperature)
+    # ── Contrastive / alignment loss ──
+    c_loss = cosine_alignment_loss(z_proj, obs_mask, modalities)
 
     # ── Cross-modal imputation loss ──
     lomo_loss = cross_modal_imputation_loss(
@@ -312,13 +357,62 @@ def run_batch(
     return total, recon_loss.item(), c_loss.item(), lomo_loss.item()
 
 
+# ── LOO imputation eval ───────────────────────────────────────────────────────
+
+@torch.no_grad()
+def eval_loo_imputation(
+    model: UniMIMIR,
+    data_dict: dict,
+    samples: list,
+    device: torch.device,
+    batch_size: int = 512,
+) -> dict:
+    """LOO imputation metrics on samples present in all modalities."""
+    model.eval()
+    modalities = list(data_dict.keys())
+    full = [s for s in samples if all(s in data_dict[m].index for m in modalities)]
+    if not full:
+        return {}
+
+    metrics = {}
+    for target in modalities:
+        present = [m for m in modalities if m != target]
+        tensors = {
+            m: torch.tensor(data_dict[m].loc[full].values, dtype=torch.float32)
+            for m in present
+        }
+        true = data_dict[target].loc[full].values.astype(np.float32)
+        preds = []
+        for start in range(0, len(full), batch_size):
+            end = min(start + batch_size, len(full))
+            z_list = [
+                model.project(model.encode(tensors[m][start:end].to(device), m), m)
+                for m in present
+            ]
+            z_shared = torch.stack(z_list, dim=1).mean(dim=1)
+            preds.append(model.decode(z_shared, target).cpu().numpy())
+        pred = np.concatenate(preds, axis=0)
+        mse = float(np.mean((pred - true) ** 2))
+        r, _ = pearsonr(pred.ravel(), true.ravel())
+        metrics[(tuple(present), target)] = {"mse": mse, "pearson": float(r)}
+    return metrics
+
+
+def format_loo_metrics(metrics: dict) -> str:
+    parts = []
+    for (present, target), m in metrics.items():
+        present_str = "+".join(present)
+        parts.append(f"{present_str}→{target}: MSE={m['mse']:.4f} r={m['pearson']:.4f}")
+    return " | ".join(parts)
+
+
 # ── Train / eval epochs ───────────────────────────────────────────────────────
 
 def train_epoch(
-    model: MIMIRPhase2,
+    model: UniMIMIR,
     loader: DataLoader,
     optimizer: Adam,
-    config: Phase2Config,
+    config: UniMIMIRConfig,
     device: torch.device,
 ) -> list:
     model.train()
@@ -339,9 +433,9 @@ def train_epoch(
 
 @torch.no_grad()
 def eval_epoch(
-    model: MIMIRPhase2,
+    model: UniMIMIR,
     loader: DataLoader,
-    config: Phase2Config,
+    config: UniMIMIRConfig,
     device: torch.device,
 ) -> list:
     model.eval()
@@ -396,7 +490,7 @@ def get_device() -> torch.device:
 
 
 def main():
-    config = Phase2Config()
+    config = UniMIMIRConfig()
     torch.manual_seed(config.seed)
     np.random.seed(config.seed)
     device = get_device()
@@ -417,7 +511,8 @@ def main():
     val_ds = MultiOmicDataset(
         data_dict, splits["val"], config.mask_rate, config.sentinel
     )
-    print(f"Samples  train={len(train_ds)}  val={len(val_ds)}")
+    val_full_samples = [s for s in splits["val"] if all(s in data_dict[m].index for m in data_dict)]
+    print(f"Samples  train={len(train_ds)}  val={len(val_ds)}  val_full={len(val_full_samples)}")
 
     pin = device.type == "cuda"
     train_loader = DataLoader(
@@ -430,7 +525,7 @@ def main():
     )
 
     # ── Model ──
-    model = MIMIRPhase2(
+    model = UniMIMIR(
         modality_dims=modality_dims,
         latent_dim=config.latent_dim,
         shared_dim=config.shared_dim,
@@ -450,7 +545,7 @@ def main():
 
     os.makedirs(config.checkpoint_dir, exist_ok=True)
     best_ckpt = os.path.join(config.checkpoint_dir, "best_model.pt")
-    best_val   = float("inf")
+    best_loo_r = -float("inf")  # mean Pearson r across all LOO targets
     patience_ctr = 0
 
     history = {
@@ -485,15 +580,21 @@ def main():
         history["val_contrast"].append(vl[2])
         history["val_lomo"].append(vl[3])
 
-        if vl[0] < best_val:
-            best_val = vl[0]
+        loo = eval_loo_imputation(model, data_dict, val_full_samples, device)
+        mean_r = float(np.mean([m["pearson"] for m in loo.values()])) if loo else -1.0
+        if loo:
+            print(f"        LOO │ {format_loo_metrics(loo)}  [mean r={mean_r:.4f}{'*' if mean_r > best_loo_r else ''}]")
+
+        if mean_r > best_loo_r:
+            best_loo_r = mean_r
             patience_ctr = 0
             torch.save(
                 {
                     "epoch": epoch,
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
-                    "val_loss": best_val,
+                    "val_loss": vl[0],
+                    "best_loo_r": best_loo_r,
                     "config": config,
                     "modality_dims": modality_dims,
                 },
@@ -511,7 +612,7 @@ def main():
     print(f"Loss history saved → {history_path}")
 
     plot_learning_curves(history, config.checkpoint_dir)
-    print(f"\nBest val loss: {best_val:.4f}  →  {best_ckpt}")
+    print(f"\nBest LOO mean r: {best_loo_r:.4f}  →  {best_ckpt}")
 
 
 if __name__ == "__main__":
