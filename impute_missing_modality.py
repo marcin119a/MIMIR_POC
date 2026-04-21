@@ -1,7 +1,7 @@
 """
-Phase 3: Imputation with Missing Modalities
+Imputation with Missing Modalities
 
-Loads a pretrained MIMIRPhase2 checkpoint and evaluates imputation under
+Loads a pretrained UniMIMIR checkpoint and evaluates imputation under
 two missingness scenarios:
   1. Leave-one-modality-out (LOO)
   2. All possible missingness patterns
@@ -9,7 +9,7 @@ two missingness scenarios:
 Usage:
     python impute_missing_modality.py
     python impute_missing_modality.py --data data/tcga_redo_mlomicZ.pkl --splits data/splits.json
-    python impute_missing_modality.py --checkpoint checkpoints_phase2/best_model.pt
+    python impute_missing_modality.py --checkpoint checkpoints/best_model.pt
     python impute_missing_modality.py --skip_all_possible
 """
 
@@ -28,13 +28,13 @@ import torch
 from scipy.stats import pearsonr, spearmanr
 
 import sys
-from phase2_model import MIMIRPhase2
-from train_phase2 import Phase2Config as _Phase2Config
-# Checkpoint was saved from __main__, so unpickling requires Phase2Config there
-sys.modules[__name__].Phase2Config = _Phase2Config
+from unimimir_model import UniMIMIR
+from train_unimimir import UniMIMIRConfig as _UniMIMIRConfig
+# Checkpoint was saved from __main__, so unpickling requires UniMIMIRConfig there
+sys.modules[__name__].UniMIMIRConfig = _UniMIMIRConfig
 if "__main__" not in sys.modules:
     sys.modules["__main__"] = sys.modules[__name__]
-sys.modules["__main__"].Phase2Config = _Phase2Config
+sys.modules["__main__"].UniMIMIRConfig = _UniMIMIRConfig
 
 
 # ─── Display names ────────────────────────────────────────────────────────────
@@ -47,12 +47,12 @@ DISPLAY_NAME = {
 
 # ─── Model loading ────────────────────────────────────────────────────────────
 
-def load_model(checkpoint_path: str, device: torch.device) -> tuple[MIMIRPhase2, dict]:
+def load_model(checkpoint_path: str, device: torch.device) -> tuple[UniMIMIR, dict]:
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     modality_dims = ckpt["modality_dims"]
     cfg = ckpt["config"]
 
-    model = MIMIRPhase2(
+    model = UniMIMIR(
         modality_dims=modality_dims,
         latent_dim=cfg.latent_dim,
         shared_dim=cfg.shared_dim,
@@ -71,7 +71,7 @@ def load_model(checkpoint_path: str, device: torch.device) -> tuple[MIMIRPhase2,
 
 @torch.no_grad()
 def impute(
-    model: MIMIRPhase2,
+    model: UniMIMIR,
     data: dict,
     present_mods: list[str],
     target_mod: str,
@@ -101,7 +101,7 @@ def impute(
 
 
 def leave_one_out_imputation(
-    model: MIMIRPhase2,
+    model: UniMIMIR,
     data: dict,
     samples: list[str],
     batch_size: int,
@@ -121,7 +121,7 @@ def leave_one_out_imputation(
 
 
 def all_possible_imputation(
-    model: MIMIRPhase2,
+    model: UniMIMIR,
     data: dict,
     samples: list[str],
     batch_size: int,
@@ -254,7 +254,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Phase 3: Impute missing modalities")
     p.add_argument("--data",       default="data/tcga_redo_mlomicZ.pkl",      help="Path to multi-omic pickle")
     p.add_argument("--splits",     default="data/splits.json",                help="Path to splits JSON")
-    p.add_argument("--checkpoint", default="checkpoints_phase2/best_model.pt",help="MIMIRPhase2 checkpoint (.pt)")
+    p.add_argument("--checkpoint", default="checkpoints/best_model.pt",       help="UniMIMIR checkpoint (.pt)")
     p.add_argument("--out",        default="results/imputation_modality",      help="Output directory")
     p.add_argument("--device",     default=None,                               help="cuda / mps / cpu (auto if omitted)")
     p.add_argument("--batch_size", type=int, default=256)

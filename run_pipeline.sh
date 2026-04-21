@@ -36,7 +36,7 @@ $PYTHON "$ROOT/scripts/create_splits.py" \
     --seed "$SEED"
 
 # ── 3. train ──────────────────────────────────────────────────────────────────
-log "=== STEP 3: train Phase 2 model ==="
-$PYTHON "$ROOT/train_phase2.py"
+log "=== STEP 3: train UniMIMIR model ==="
+$PYTHON "$ROOT/train_unimimir.py"
 
-log "=== DONE — checkpoint saved to checkpoints_phase2/best_model.pt ==="
+log "=== DONE — checkpoint saved to checkpoints/best_model.pt ==="
