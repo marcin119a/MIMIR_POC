@@ -101,6 +101,8 @@ def merge_and_normalize_data(rna_df, dna_df, top_n_sites=24):
     # Keep only successfully merged records
     merged_df = merged_df[merged_df['_merge'] == 'both'].copy()
     merged_df = merged_df.drop(columns=['_merge'])
+    rna_only = rna_only.drop(columns=['_merge'], errors='ignore')
+    dna_only = dna_only.drop(columns=['_merge'], errors='ignore')
     
     print(f"\nMerged data shape before filtering: {merged_df.shape}")
     
@@ -134,10 +136,10 @@ def merge_and_normalize_data(rna_df, dna_df, top_n_sites=24):
         count = (merged_df['primary_site'] == cls).sum()
         print(f"  {code}: {cls} ({count} samples)")
     
-    return merged_df, label_encoder
+    return merged_df, label_encoder, rna_only, dna_only
 
 
-def build_multi_omic_dict(merged_df):
+def build_multi_omic_dict(merged_df, rna_only_df=None, dna_only_df=None):
     """
     Convert the flat merged DataFrame into the dict format expected by
     train_autoencoders.py and train_shared.py:
@@ -146,6 +148,11 @@ def build_multi_omic_dict(merged_df):
             "rna":         pd.DataFrame  [n_samples x n_rna_features],   index=case_barcode
             "methylation": pd.DataFrame  [n_samples x n_meth_features],  index=case_barcode
         }
+
+    rna_only_df / dna_only_df: optional DataFrames of samples present in only
+    one modality (already normalized). They are appended so that the union of all
+    samples is represented — missing modality rows simply won't appear in the
+    other DataFrame, enabling union-based splits.
     """
     print("\nBuilding multi-omic dict for training scripts...")
 
@@ -160,6 +167,22 @@ def build_multi_omic_dict(merged_df):
 
     rna_df_out.index.name  = "case_barcode"
     meth_df_out.index.name = "case_barcode"
+
+    if rna_only_df is not None and len(rna_only_df) > 0:
+        extra = np.stack(rna_only_df["tpm_unstranded"].values).astype(np.float32)
+        extra_df = pd.DataFrame(extra, index=rna_only_df["case_barcode"].values,
+                                columns=rna_df_out.columns)
+        extra_df.index.name = "case_barcode"
+        rna_df_out = pd.concat([rna_df_out, extra_df])
+        print(f"  + {len(extra_df)} RNA-only samples appended")
+
+    if dna_only_df is not None and len(dna_only_df) > 0:
+        extra = np.stack(dna_only_df["beta_value"].values).astype(np.float32)
+        extra_df = pd.DataFrame(extra, index=dna_only_df["case_barcode"].values,
+                                columns=meth_df_out.columns)
+        extra_df.index.name = "case_barcode"
+        meth_df_out = pd.concat([meth_df_out, extra_df])
+        print(f"  + {len(extra_df)} DNA-only samples appended")
 
     print(f"  RNA matrix:         {rna_df_out.shape}")
     print(f"  Methylation matrix: {meth_df_out.shape}")
@@ -177,7 +200,7 @@ def main():
     dna_df = prepare_dna_methylation_data(dna_path)
 
     # Merge and normalize
-    merged_df, label_encoder = merge_and_normalize_data(rna_df, dna_df)
+    merged_df, label_encoder, rna_only, dna_only = merge_and_normalize_data(rna_df, dna_df)
 
     # Save processed data
     print("\nSaving processed data...")
@@ -189,8 +212,14 @@ def main():
     with open('data/label_encoder.pkl', 'wb') as f:
         pickle.dump(label_encoder, f)
 
+    # Normalize rna_only (log1p, same as matched RNA)
+    rna_only = rna_only.copy()
+    rna_only["tpm_unstranded"] = rna_only["tpm_unstranded"].apply(
+        lambda x: np.log1p(np.array(x))
+    )
+
     # Build and save multi-omic dict for train_autoencoders.py / train_shared.py
-    multi_omic = build_multi_omic_dict(merged_df)
+    multi_omic = build_multi_omic_dict(merged_df, rna_only_df=rna_only, dna_only_df=dna_only)
     multi_omic_path = 'data/tcga_redo_mlomicZ.pkl'
     with open(multi_omic_path, 'wb') as f:
         pickle.dump(multi_omic, f)
