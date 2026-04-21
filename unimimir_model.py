@@ -11,9 +11,9 @@ def _mlp(dims: list, dropout: float = 0.1) -> nn.Sequential:
     return nn.Sequential(*layers)
 
 
-class MIMIRPhase2(nn.Module):
+class UniMIMIR(nn.Module):
     """
-    Phase 2 multi-modal shared representation model (MIMIR).
+    UniMIMIR: unified multi-modal shared representation model.
 
     Per modality m:
         h_m = encoder_m(x_m)              input_dim -> latent_dim

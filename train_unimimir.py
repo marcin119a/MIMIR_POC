@@ -1,5 +1,5 @@
 """
-Phase 2 training: multi-modal shared representation.
+UniMIMIR training: unified multi-modal shared representation.
 
 Jointly optimises three objectives:
     L = Σ_m L_recon(m)  +  λ_contrast · L_contrast  +  λ_cross · L_cross
@@ -9,7 +9,8 @@ where
   L_contrast  – cosine alignment across ordered modality pairs
   L_cross     – leave-one-modality-out MSE imputation loss
 
-Encoders and decoders are randomly initialised (no Phase 1 pretraining).
+Supports patients with any subset of modalities (including a single modality).
+Encoders and decoders are randomly initialised (no pretraining).
 """
 
 import json
@@ -25,17 +26,17 @@ from scipy.stats import pearsonr
 from torch.optim import Adam
 from torch.utils.data import DataLoader, Dataset
 
-from phase2_model import MIMIRPhase2
+from unimimir_model import UniMIMIR
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
 @dataclass
-class Phase2Config:
+class UniMIMIRConfig:
     # Paths
     data_path: str = "data/tcga_redo_mlomicZ.pkl"
     splits_path: str = "data/splits.json"
-    checkpoint_dir: str = "checkpoints_phase2"
+    checkpoint_dir: str = "checkpoints"
 
     # Model
     latent_dim: int = 128
@@ -194,7 +195,7 @@ def cosine_alignment_loss(
 
 
 def cross_modal_imputation_loss(
-    model: MIMIRPhase2,
+    model: UniMIMIR,
     orig: dict,
     feat_mask: dict,
     obs_mask: torch.Tensor,
@@ -281,9 +282,9 @@ def sample_obs_mask(
 # ── Batch step ────────────────────────────────────────────────────────────────
 
 def run_batch(
-    model: MIMIRPhase2,
+    model: UniMIMIR,
     batch: dict,
-    config: Phase2Config,
+    config: UniMIMIRConfig,
     device: torch.device,
     training: bool,
 ) -> tuple:
@@ -357,7 +358,7 @@ def run_batch(
 
 @torch.no_grad()
 def eval_loo_imputation(
-    model: MIMIRPhase2,
+    model: UniMIMIR,
     data_dict: dict,
     samples: list,
     device: torch.device,
@@ -405,10 +406,10 @@ def format_loo_metrics(metrics: dict) -> str:
 # ── Train / eval epochs ───────────────────────────────────────────────────────
 
 def train_epoch(
-    model: MIMIRPhase2,
+    model: UniMIMIR,
     loader: DataLoader,
     optimizer: Adam,
-    config: Phase2Config,
+    config: UniMIMIRConfig,
     device: torch.device,
 ) -> list:
     model.train()
@@ -429,9 +430,9 @@ def train_epoch(
 
 @torch.no_grad()
 def eval_epoch(
-    model: MIMIRPhase2,
+    model: UniMIMIR,
     loader: DataLoader,
-    config: Phase2Config,
+    config: UniMIMIRConfig,
     device: torch.device,
 ) -> list:
     model.eval()
@@ -457,7 +458,7 @@ def get_device() -> torch.device:
 
 
 def main():
-    config = Phase2Config()
+    config = UniMIMIRConfig()
     torch.manual_seed(config.seed)
     np.random.seed(config.seed)
     device = get_device()
@@ -492,7 +493,7 @@ def main():
     )
 
     # ── Model ──
-    model = MIMIRPhase2(
+    model = UniMIMIR(
         modality_dims=modality_dims,
         latent_dim=config.latent_dim,
         shared_dim=config.shared_dim,

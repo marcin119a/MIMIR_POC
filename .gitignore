@@ -31,7 +31,7 @@ htmlcov/
 .DS_Store
 
 # ML: checkpoints & experiment logs (adjust if you need to track small artifacts)
-checkpoints_phase2/
+checkpoints/
 *.pt
 *.pth
 *.ckpt
